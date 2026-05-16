@@ -303,7 +303,8 @@ function fetchTile(z,x,y){
 }
 
 function drawTiles(){
-  const W=tileCanvas.width, H=tileCanvas.height;
+  const W=resize._W||tileCanvas.clientWidth;
+  const H=resize._H||tileCanvas.clientHeight;
   tileCtx.fillStyle='#040b1a';
   tileCtx.fillRect(0,0,W,H);
 
@@ -334,8 +335,8 @@ function drawTiles(){
 // Convert lat/lon to pixel on the overlay canvas
 let _otx=0,_oty=0;
 function ll2px(lat,lon){
-  const W=overlayCanvas.width;
-  const H=overlayCanvas.height;
+  const W=resize._W||overlayCanvas.clientWidth;
+  const H=resize._H||overlayCanvas.clientHeight;
   const{fx,fy}=ll2tileFrac(lat,lon,mapZoom);
   return[Math.round((fx-_otx)*TILE_SIZE), Math.round((fy-_oty)*TILE_SIZE)];
 }
@@ -345,7 +346,8 @@ const overlayCanvas=document.getElementById('map-canvas');
 const oc=overlayCanvas.getContext('2d');
 
 function drawOverlay(){
-  const W=overlayCanvas.width, H=overlayCanvas.height;
+  const W=resize._W||overlayCanvas.clientWidth;
+  const H=resize._H||overlayCanvas.clientHeight;
   oc.clearRect(0,0,W,H);
 
   // Grid lat/lon labels
@@ -396,7 +398,8 @@ function drawOverlay(){
 
   // Divergence connector line
   if(attack&&sim.rTrack.length>0){
-    const rp=ll2px(sim.real[0],sim.real[1]);
+    const visLat=sim.real[0]+(attack&&attack._visOffset?attack._visOffset:0);
+    const rp=ll2px(visLat,sim.real[1]);
     const sp=ll2px(sim.shad[0],sim.shad[1]);
     const dx=rp[0]-sp[0],dy=rp[1]-sp[1];
     if(Math.sqrt(dx*dx+dy*dy)>8){
@@ -414,7 +417,7 @@ function drawOverlay(){
   function drawPlane(la,lo,hdg,col,sz){
     const [x,y]=ll2px(la,lo);
     if(x<-30||x>W+30||y<-30||y>H+30) return;
-    oc.save();oc.translate(x,y);oc.rotate((hdg-90)*Math.PI/180);
+    oc.save();oc.translate(x,y);oc.rotate(hdg*Math.PI/180);
     oc.fillStyle=col;
     oc.beginPath();oc.ellipse(0,0,sz*0.18,sz*0.52,0,0,Math.PI*2);oc.fill();
     oc.beginPath();oc.moveTo(0,-sz*0.1);oc.lineTo(-sz*0.5,sz*0.32);oc.lineTo(sz*0.5,sz*0.32);oc.closePath();oc.fill();
@@ -424,7 +427,8 @@ function drawOverlay(){
   if(sim.shad) drawPlane(sim.shad[0],sim.shad[1],sim.shad[4],'#26b2b2',13);
   if(sim.real){
     const anyAlert=alerts.pos||alerts.alt||alerts.cas;
-    drawPlane(sim.real[0],sim.real[1],sim.real[4],anyAlert?'#e05050':'#3472c4',17);
+    const visLat=sim.real[0]+(attack&&attack._visOffset?attack._visOffset:0);
+    drawPlane(visLat,sim.real[1],sim.real[4],anyAlert?'#e05050':'#3472c4',17);
   }
 }
 
@@ -467,7 +471,7 @@ let chartMax={pos:1.0,alt:400,cas:20};
 function resetSim(){
   sim={t:0,real:[51.477,-0.461,35000,280,260,64000,55000],
        shad:[51.477,-0.461,35000,280,260,64000,55000],
-       rTrack:[],sTrack:[],wpi:1,anchor:0};
+       rTrack:[],sTrack:[],wpi:1,swpi:1,anchor:0};
   attack=null;alerts={pos:false,alt:false,cas:false};
   alertTimes={pos:null,alt:null,cas:null};
   pcnt={pos:0,alt:0,cas:0};divHistory=[];
@@ -504,6 +508,7 @@ function clearAttack(){
   document.getElementById('timer-panel').className='';
 }
 
+// Get nav command for real aircraft (uses real position)
 function getCmd(){
   const i=Math.min(sim.wpi,WPS.length-1);
   const[,wla,wlo]=WPS[i];
@@ -513,41 +518,81 @@ function getCmd(){
   return{alt:35000,hdg,thr:0.82};
 }
 
+// Get nav command for shadow aircraft (uses shadow's OWN position, never spoofed real)
+function getShadCmd(){
+  const i=Math.min(sim.swpi,WPS.length-1);
+  const[,wla,wlo]=WPS[i];
+  const dl=wla-sim.shad[0],dm=wlo-sim.shad[1];
+  let hdg=(Math.atan2(dm,dl)*180/Math.PI+360)%360;
+  if(Math.sqrt(dl*dl+dm*dm)*60<1.5&&sim.swpi<WPS.length-1)sim.swpi++;
+  return{alt:35000,hdg,thr:0.82};
+}
+
 function tick(dtReal){
   if(paused)return;
   const dt=Math.min(dtReal*speed,SIM_DUR-sim.t);if(dt<=0)return;
   sim.t=Math.min(sim.t+dt,SIM_DUR);
-  const cmd=getCmd();let rc={...cmd};
+  const cmd=getCmd();
+  const shadCmd=getShadCmd();
+  let rc={...cmd};
   if(attack&&sim.t>=attack.startT&&attack.type==='atc')rc.hdg=(cmd.hdg+30+360)%360;
-  sim.shad=stepModel(sim.shad,dt,cmd,false);
+  // Shadow always uses its own independent navigation command
+  sim.shad=stepModel(sim.shad,dt,shadCmd,false);
   sim.real=stepModel(sim.real,dt,rc,true);
+  // Apply attack as incremental offset per tick (not cumulative re-application)
   if(attack&&sim.t>=attack.startT){
-    const e=sim.t-attack.startT;
-    if(attack.type==='gps')sim.real[0]+=Math.min(e/60*0.10,6)/60;
-    else if(attack.type==='pitot')sim.real[3]+=Math.min(e/30*40,40);
+    // GPS spoof: physics drift drives detection engine; visual offset drives map rendering
+    // They are kept SEPARATE — visual offset never touches sim.real which the
+    // divergence engine reads, so detection timing is based on physics only.
+    if(attack.type==='gps'){
+      const simDt=dt*speed;
+      // Physics: 0.625nm/min → crosses 0.5nm threshold at ~48 sim-seconds
+      const physicsDrift=0.625/3600; // deg lat per sim-second
+      sim.real[0]+=physicsDrift*simDt;
+      // Visual: accumulated separately for map rendering only
+      if(attack._visOffset===undefined) attack._visOffset=0;
+      attack._visOffset+=3.0/3600*simDt; // deg, never read by divergence engine
+    }
+    // Pitot spoof: ramp airspeed offset using sim-time elapsed
+    else if(attack.type==='pitot'){
+      if(!attack._startSimT) attack._startSimT=sim.t;
+      const simElapsed=sim.t-attack._startSimT;
+      const targetOffset=Math.min(simElapsed/30*40,40);
+      if(!attack._baseCas) attack._baseCas=sim.real[3];
+      sim.real[3]=attack._baseCas+targetOffset;
+    }
   }
   sim.anchor+=dt;
-  if(sim.anchor>=60){sim.anchor=0;sim.shad[0]+=0.15*(sim.real[0]-sim.shad[0]);sim.shad[1]+=0.15*(sim.real[1]-sim.shad[1]);}
+  // Only anchor shadow to real position when NO attack is active.
+  // During an attack the real position is potentially spoofed — anchoring
+  // to it would drag the shadow toward the false position, defeating detection.
+  if(sim.anchor>=60){
+    sim.anchor=0;
+    if(!attack){
+      sim.shad[0]+=0.15*(sim.real[0]-sim.shad[0]);
+      sim.shad[1]+=0.15*(sim.real[1]-sim.shad[1]);
+    }
+  }
   const last=divHistory.length>0?divHistory[divHistory.length-1]:null;
   if(!last||sim.t-last.t>=3){
     const dl=Math.abs(sim.real[0]-sim.shad[0]),dm=Math.abs(sim.real[1]-sim.shad[1]);
     const pos=Math.sqrt(dl*dl+dm*dm)*60;
     const e={t:sim.t,pos,alt:Math.abs(sim.real[2]-sim.shad[2]),cas:Math.abs(sim.real[3]-sim.shad[3])};
     divHistory.push(e);if(divHistory.length>HIST)divHistory.shift();
-    sim.rTrack.push([sim.real[0],sim.real[1]]);
+    // Store visual position (physics + visual offset) in rTrack for map display
+    const visLat=sim.real[0]+(attack&&attack._visOffset?attack._visOffset:0);
+    sim.rTrack.push([visLat,sim.real[1]]);
     sim.sTrack.push([sim.shad[0],sim.shad[1]]);
     chartMax.pos=Math.max(THRESH.pos*2.5,pos*1.2,chartMax.pos);
     chartMax.alt=Math.max(THRESH.alt*2.5,e.alt*1.2,chartMax.alt);
     chartMax.cas=Math.max(THRESH.cas*2.5,e.cas*1.2,chartMax.cas);
-  }
-  if(divHistory.length>0){
-    const lv=divHistory[divHistory.length-1];
+    // Persistence counter: only increments once per 3 sim-sec record
+    // — speed setting cannot affect detection time in sim-seconds
     for(const[key,thr]of[['pos',THRESH.pos],['alt',THRESH.alt],['cas',THRESH.cas]]){
-      if(lv[key]>thr){
+      if(e[key]>thr){
         pcnt[key]++;
         if(pcnt[key]>=PERSIST&&!alerts[key]){
           alerts[key]=true;alertTimes[key]=sim.t;
-          // Record detection latency
           if(attack&&!attack.detected){
             attack.detected=true;
             attack.latency=sim.t-attack.startT;
@@ -682,8 +727,14 @@ function updateUI(){
 function resize(){
   const wrap=document.getElementById('map-wrap');
   const W=wrap.clientWidth, H=wrap.clientHeight;
-  tileCanvas.width=W; tileCanvas.height=H;
-  overlayCanvas.width=W; overlayCanvas.height=H;
+  const dpr=window.devicePixelRatio||1;
+  tileCanvas.width=W*dpr; tileCanvas.height=H*dpr;
+  tileCanvas.style.width=W+'px'; tileCanvas.style.height=H+'px';
+  tileCtx.setTransform(dpr,0,0,dpr,0,0);
+  overlayCanvas.width=W*dpr; overlayCanvas.height=H*dpr;
+  overlayCanvas.style.width=W+'px'; overlayCanvas.style.height=H+'px';
+  oc.setTransform(dpr,0,0,dpr,0,0);
+  resize._W=W; resize._H=H;
 }
 
 // ── Main loop ─────────────────────────────────────────────────
